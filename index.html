@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Escáner de códigos</title>
+<style>
+:root{--bg:#f5f6f8;--fg:#1c1f24;--card:#fff;--accent:#1f6feb;--border:#d0d7de;--ok:#1a7f37;--err:#cf222e;--muted:#57606a}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0d1117;--fg:#e6edf3;--card:#161b22;--accent:#58a6ff;--border:#30363d;--muted:#8b949e}}
+:root[data-theme="dark"]{--bg:#0d1117;--fg:#e6edf3;--card:#161b22;--accent:#58a6ff;--border:#30363d;--muted:#8b949e}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:16px}
+h1{font-size:1.3rem;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px}
+video{width:100%;max-height:50vh;background:#000;border-radius:10px;display:none}
+video.on{display:block;margin-bottom:10px}
+label{display:block;font-weight:600;margin:10px 0 4px}
+input,select,textarea{width:100%;font:inherit;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg)}
+textarea{min-height:64px;resize:vertical}
+button{font:inherit;font-weight:600;padding:12px 14px;border:0;border-radius:10px;background:var(--accent);color:#fff;width:100%;margin-top:10px}
+button.sec{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button:disabled{opacity:.5}
+#status{margin-top:12px;padding:10px;border-radius:8px;display:none;font-weight:600}
+#status.ok{display:block;background:rgba(26,127,55,.12);color:var(--ok)}
+#status.err{display:block;background:rgba(207,34,46,.12);color:var(--err)}
+#status.info{display:block;color:var(--muted)}
+small{color:var(--muted);display:block;margin-top:6px}
+</style>
+</head>
+<body>
+<h1>Escáner de códigos</h1>
+
+<div class="card">
+  <video id="cam" playsinline muted></video>
+  <button id="btnScan" class="sec">Activar cámara y escanear</button>
+  <small id="scanMsg">Apunta al código de barras o Code 128.</small>
+  <label for="codigo">Código</label>
+  <input id="codigo" autocomplete="off" placeholder="Se llena al escanear o escríbelo a mano">
+  <small id="formato"></small>
+</div>
+
+<div class="card">
+  <label for="tipo">Tipo</label>
+  <select id="tipo"><option value="Bodega">Bodega</option><option value="Medidor">Medidor</option></select>
+  <label for="cantidad">Cantidad o lectura</label>
+  <input id="cantidad" inputmode="decimal" autocomplete="off">
+  <label for="usuario">Usuario</label>
+  <input id="usuario" autocomplete="name">
+  <label for="notas">Notas</label>
+  <textarea id="notas"></textarea>
+  <button id="btnSave">Guardar</button>
+  <button id="btnToken" class="sec">Configurar token</button>
+  <div id="status"></div>
+</div>
+
+<script>
+const ENDPOINT = 'https://script.google.com/macros/s/AKfycbzs8I1tcDEUdvNpFBe2sQYYHAYPLa5bDaaHXNXT9FdpgSCKhmgxdyq4_wiGXZCEnCb8-A/exec';
+const HOJA = 'Escaneos';
+
+const $ = id => document.getElementById(id);
+const setStatus = (msg, cls) => { const s = $('status'); s.textContent = msg; s.className = cls; };
+
+function getToken() {
+  try { return localStorage.getItem('escaner_token') || ''; } catch (e) { return ''; }
+}
+function askToken(force) {
+  let t = getToken();
+  if (!t || force) {
+    t = (prompt('Pega el token del script (se guarda solo en este dispositivo):') || '').trim();
+    if (t) { try { localStorage.setItem('escaner_token', t); } catch (e) {} }
+  }
+  return t;
+}
+$('btnToken').addEventListener('click', () => { askToken(true); setStatus('Token guardado en este dispositivo.', 'info'); });
+
+try {
+  const u = localStorage.getItem('usuario'); if (u) $('usuario').value = u;
+  const t = localStorage.getItem('tipo'); if (t) $('tipo').value = t;
+} catch (e) {}
+$('usuario').addEventListener('change', () => { try { localStorage.setItem('usuario', $('usuario').value); } catch (e) {} });
+$('tipo').addEventListener('change', () => { try { localStorage.setItem('tipo', $('tipo').value); } catch (e) {} });
+
+let stream = null, detector = null, timer = null, lastCode = '', lastTime = 0;
+const FORMATS = ['code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_39', 'codabar', 'itf'];
+
+async function startScan() {
+  if (!('BarcodeDetector' in window)) {
+    $('scanMsg').textContent = 'Este navegador no soporta el escáner. Escribe el código a mano.';
+    return;
+  }
+  try {
+    detector = new BarcodeDetector({ formats: FORMATS });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    const v = $('cam');
+    v.srcObject = stream;
+    v.classList.add('on');
+    await v.play();
+    $('btnScan').textContent = 'Detener cámara';
+    $('scanMsg').textContent = 'Buscando código...';
+    timer = setInterval(detectOnce, 300);
+  } catch (e) {
+    $('scanMsg').textContent = 'No se pudo abrir la cámara (' + e.message + '). Escribe el código a mano.';
+    stopScan();
+  }
+}
+
+async function detectOnce() {
+  const v = $('cam');
+  if (!detector || v.readyState < 2) return;
+  try {
+    const codes = await detector.detect(v);
+    if (!codes.length) return;
+    const c = codes[0];
+    const now = Date.now();
+    if (c.rawValue === lastCode && now - lastTime < 2000) return;
+    lastCode = c.rawValue; lastTime = now;
+    $('codigo').value = c.rawValue;
+    $('formato').textContent = 'Formato: ' + c.format;
+    $('scanMsg').textContent = 'Código leído. Puedes escanear otro o guardar.';
+    if (navigator.vibrate) navigator.vibrate(120);
+  } catch (e) {}
+}
+
+function stopScan() {
+  clearInterval(timer); timer = null;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  const v = $('cam'); v.srcObject = null; v.classList.remove('on');
+  $('btnScan').textContent = 'Activar cámara y escanear';
+}
+
+$('btnScan').addEventListener('click', () => stream ? stopScan() : startScan());
+
+$('btnSave').addEventListener('click', async () => {
+  const codigo = $('codigo').value.trim();
+  const cantidad = $('cantidad').value.trim();
+  if (!codigo) return setStatus('Falta el código.', 'err');
+  if (!cantidad) return setStatus('Falta la cantidad o lectura.', 'err');
+  const token = askToken(false);
+  if (!token) return setStatus('Falta el token. Pulsa "Configurar token".', 'err');
+  const formato = $('formato').textContent.replace('Formato: ', '') || 'manual';
+  const payload = {
+    token: token,
+    hoja: HOJA,
+    fecha: new Date().toISOString(),
+    tipo: $('tipo').value,
+    codigo: codigo,
+    formato: formato,
+    cantidad: cantidad,
+    usuario: $('usuario').value.trim(),
+    notas: $('notas').value.trim()
+  };
+  const btn = $('btnSave');
+  btn.disabled = true;
+  setStatus('Guardando...', 'info');
+  try {
+    const r = await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+    const txt = await r.text();
+    let res = {}; try { res = JSON.parse(txt); } catch (e) {}
+    if (res.ok) {
+      setStatus('Guardado en la hoja.', 'ok');
+      $('codigo').value = ''; $('formato').textContent = ''; $('cantidad').value = ''; $('notas').value = '';
+      lastCode = '';
+    } else {
+      setStatus('No se guardó: ' + (res.error || 'respuesta no válida'), 'err');
+    }
+  } catch (e) {
+    setStatus('Error de red: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
